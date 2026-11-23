@@ -16,12 +16,14 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
+    flashinfer_bf16_unusable_tuning_file,
     init_flashinfer_bf16_tuning_buckets,
     is_flashinfer_auto_bf16_gemm_supported,
     is_flashinfer_bf16_gemm_supported,
-    is_flashinfer_bf16_shape_tuned,
+    is_flashinfer_bf16_gemm_tuned,
     is_flashinfer_cutedsl_bf16_gemm_supported,
     load_flashinfer_bf16_tuning_for_current_model,
+    warn_flashinfer_bf16_untuned,
 )
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op, eager_bypass_custom_op
@@ -185,11 +187,17 @@ def _can_use_flashinfer_bf16(
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
     ):
         return False
-    # Only GEMMs the loaded tuning file has tactics for: FlashInfer would run an
-    # untuned one with its default tactic, which can be slower than torch.
-    if not is_flashinfer_bf16_shape_tuned(weight.shape[0], weight.shape[1]):
+    if not _bf16_mm_tensors_supported(x, weight, bias):
         return False
-    return _bf16_mm_tensors_supported(x, weight, bias)
+    # Only GEMMs the loaded tuning file has a tactic for (by M bucket, N and K):
+    # FlashInfer would run any other with its default tactic, which can be slower
+    # than torch, so those stay on torch.
+    k = weight.shape[1]
+    m = x.numel() // k
+    if is_flashinfer_bf16_gemm_tuned(m, weight.shape[0], k):
+        return True
+    warn_flashinfer_bf16_untuned(m, weight.shape[0], k)
+    return False
 
 
 # Output width below which flashinfer beats cuBLAS (swept on GB10, K=5120);
@@ -987,12 +995,22 @@ def dispatch_unquantized_gemm(
     if linear_backend == "flashinfer" and not (
         load_flashinfer_bf16_tuning_for_current_model()
     ):
-        # No tuning file for this model, TP size and GPU: FlashInfer has no
-        # tactics to use, so the unquantized BF16 GEMMs stay on torch.
-        logger.info_once(
-            "--linear-backend=flashinfer: no FlashInfer BF16 tuning file for this "
-            "model and GPU; using torch for unquantized linear layers.",
-        )
+        # FlashInfer has no tactics to use, so the unquantized BF16 GEMMs stay
+        # on torch. No file for this model, TP size and GPU is normal; a file
+        # that exists but cannot be used is not.
+        unusable = flashinfer_bf16_unusable_tuning_file()
+        if unusable is not None:
+            logger.warning_once(
+                "--linear-backend=flashinfer: the FlashInfer BF16 tuning file %s "
+                "for this model could not be used (see the message above); "
+                "using torch for unquantized linear layers.",
+                unusable.name,
+            )
+        else:
+            logger.info_once(
+                "--linear-backend=flashinfer: no FlashInfer BF16 tuning file for "
+                "this model and GPU; using torch for unquantized linear layers.",
+            )
         return cuda_unquantized_gemm
     init_flashinfer_bf16_tuning_buckets()
     logger.info_once(
